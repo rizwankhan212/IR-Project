@@ -1,0 +1,135 @@
+# ============================================================
+# 1-Click Cloud Instance Terminator & Cleanup Workflow
+# ============================================================
+# Allows deleting all running cloud instances in 1-click from GitHub Actions.
+#
+# Options:
+#   1. scale_to_zero (Default): Scales ASG to 0 and terminates all EC2 instances immediately.
+#      Stops EC2 billing completely while preserving VPC/ALB for instant restart.
+#   2. full_destroy: Runs 'terraform destroy' to delete all AWS resources entirely.
+# ============================================================
+
+name: 🛑 Stop & Delete Cloud Instances (1-Click)
+
+on:
+  workflow_dispatch:
+    inputs:
+      action_mode:
+        description: "Select Cleanup Action"
+        required: true
+        default: "scale_to_zero"
+        type: choice
+        options:
+          - "scale_to_zero"
+          - "full_destroy"
+
+concurrency:
+  group: cloud-cleanup
+  cancel-in-progress: false
+
+jobs:
+  # ────────────────────────────────────────────────────────────
+  # Action 1: Scale ASG to 0 & Terminate EC2 Instances (Fast 1-Click)
+  # ────────────────────────────────────────────────────────────
+  scale-to-zero:
+    name: 🛑 Scale to 0 & Terminate All Instances
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.action_mode == 'scale_to_zero' || github.event.inputs.action_mode == '' }}
+
+    steps:
+      - name: 🔑 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+
+      - name: ⚙️ Scale Down Auto Scaling Group to 0
+        id: scale_asg
+        run: |
+          ASG_NAME="researchsphere-asg"
+          echo "Scaling down ASG: $ASG_NAME to min=0, desired=0..."
+          if aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG_NAME" | grep -q "$ASG_NAME"; then
+            aws autoscaling update-auto-scaling-group \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --min-size 0 \
+              --desired-capacity 0
+            echo "asg_status=scaled" >> $GITHUB_OUTPUT
+            echo "✅ Auto Scaling Group $ASG_NAME successfully scaled to 0."
+          else
+            echo "asg_status=not_found" >> $GITHUB_OUTPUT
+            echo "⚠️ Auto Scaling Group $ASG_NAME not found."
+          fi
+
+      - name: 💥 Force Terminate Any Active EC2 Instances
+        id: terminate_ec2
+        run: |
+          echo "Scanning for active project EC2 instances..."
+          INSTANCE_IDS=$(aws ec2 describe-instances \
+            --filters "Name=tag:Project,Values=researchsphere" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query "Reservations[].Instances[].InstanceId" \
+            --output text)
+
+          if [ -n "$INSTANCE_IDS" ] && [ "$INSTANCE_IDS" != "None" ]; then
+            echo "Found active instances: $INSTANCE_IDS"
+            aws ec2 terminate-instances --instance-ids $INSTANCE_IDS
+            echo "terminated_ids=$INSTANCE_IDS" >> $GITHUB_OUTPUT
+            echo "count=$(echo $INSTANCE_IDS | wc -w)" >> $GITHUB_OUTPUT
+          else
+            echo "No active EC2 instances found."
+            echo "terminated_ids=None" >> $GITHUB_OUTPUT
+            echo "count=0" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 📋 Summary
+        run: |
+          echo "### 🛑 Cloud Instances Successfully Terminated" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Action | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Auto Scaling Group** | Scaled to 0 (min=0, desired=0) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Terminated Instances** | \`${{ steps.terminate_ec2.outputs.terminated_ids }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Instances Terminated Count** | ${{ steps.terminate_ec2.outputs.count }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Compute Billing Status** | 🛑 **STOPPED** |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "All running cloud compute instances have been terminated in one click." >> $GITHUB_STEP_SUMMARY
+
+  # ────────────────────────────────────────────────────────────
+  # Action 2: Complete Terraform Destroy (Full Infrastructure Cleanup)
+  # ────────────────────────────────────────────────────────────
+  terraform-destroy:
+    name: 💥 Full Infrastructure Destroy
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.action_mode == 'full_destroy' }}
+
+    env:
+      TF_VAR_aws_access_key: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      TF_VAR_aws_secret_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      TF_VAR_aws_region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+      TF_VAR_docker_image: "ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:latest"
+      TF_VAR_ghcr_username: ${{ github.actor }}
+      TF_VAR_ghcr_token: ${{ secrets.GITHUB_TOKEN }}
+      TF_VAR_key_pair_name: ${{ secrets.EC2_KEY_PAIR_NAME }}
+
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: ⚙️ Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.x"
+
+      - name: 🔍 Terraform Init
+        working-directory: ./terraform
+        run: terraform init
+
+      - name: 💥 Terraform Destroy
+        working-directory: ./terraform
+        run: terraform destroy -auto-approve -input=false
+
+      - name: 📋 Summary
+        run: |
+          echo "### 💥 Full Cloud Infrastructure Destroyed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "All EC2 instances, Application Load Balancers, Security Groups, and VPC resources have been destroyed." >> $GITHUB_STEP_SUMMARY

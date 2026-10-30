@@ -140,8 +140,29 @@ interpreted using their representative keywords and paper contents.
 -   The update package does not include your existing database or PDF
     collection.
 
+## 1-Click Cloud Instance Control & Deletion
+
+To prevent ongoing AWS EC2 charges when not in use, you can terminate all running cloud instances in **one click** using any of the following methods:
+
+### 1. In the Web App (Streamlit UI)
+1. Navigate to **Cloud Management** in the sidebar.
+2. Click **🛑 Delete & Terminate All Running Cloud Instances**.
+3. The Auto Scaling Group will immediately scale down to `0` and terminate all active EC2 instances.
+4. You can also click **🟢 Scale Up (1 Instance)** to turn the instances back on anytime.
+
+### 2. GitHub Actions (Web UI)
+1. In your GitHub repository, open the **Actions** tab.
+2. Select **🛑 Stop & Delete Cloud Instances (1-Click)**.
+3. Click **Run workflow**.
+
+### 3. Desktop / Local 1-Click Script
+- **Windows double-click:** Double-click [`scripts/delete_instances.bat`](file:///d:/Rizwan%20Codes/IR%20project/TF-Project/scripts/delete_instances.bat).
+- **PowerShell:** Run [`scripts/delete_instances.ps1`](file:///d:/Rizwan%20Codes/IR%20project/TF-Project/scripts/delete_instances.ps1).
+- **Terminal:** Run `python scripts/delete_instances.py`.
+
 ## Academic Purpose
 
 ResearchSphere demonstrates practical Information Retrieval techniques
 and an unsupervised learning approach to discovering groups of related
 research papers. It is intended for educational and mini-project use.
+

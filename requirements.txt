@@ -1,3 +1,7 @@
 streamlit
 pymupdf
 scikit-learn
+numpy
+plotly
+pandas
+boto3

@@ -26,6 +26,15 @@ from pdf_reader import extract_text, find_matching_pages, get_full_text
 from search_engine import search_bm25, search_papers
 from search_history import initialize_history, save_search, get_search_history, clear_search_history
 from document_clustering import cluster_papers
+from cloud_manager import (
+    get_cloud_status,
+    delete_all_running_instances,
+    scale_up_instances,
+    DEFAULT_REGION,
+    DEFAULT_PROJECT,
+    DEFAULT_ASG,
+)
+
 
 
 st.set_page_config(page_title="ResearchSphere | Research Discovery", layout="wide")
@@ -140,7 +149,7 @@ with st.sidebar:
     st.divider()
     section = st.radio(
         "Workspace",
-        ["Discover", "Library", "Search History", "Index Explorer", "Ranking Comparison", "Document Clustering", "Evaluation", "IR Analysis"],
+        ["Discover", "Library", "Search History", "Index Explorer", "Ranking Comparison", "Document Clustering", "Evaluation", "IR Analysis", "Cloud Management"],
         label_visibility="collapsed",
         key="workspace",
     )
@@ -957,3 +966,189 @@ elif section == "IR Analysis":
                 "TF-IDF cosine scores and BM25 scores use different scales; "
                 "compare their ranking order, not the raw score values."
             )
+
+elif section == "Cloud Management":
+    st.title("Cloud Infrastructure & Instance Control")
+    st.write("Real-time monitoring and 1-click controls for ResearchSphere cloud instances.")
+    st.caption("Instantly scale down Auto Scaling Groups and terminate all running EC2 instances to stop AWS billing.")
+    st.divider()
+
+    # Credential & Configuration Expander
+    with st.expander("⚙️ AWS Configuration & Credentials (Optional)", expanded=False):
+        c_k1, c_k2, c_k3 = st.columns([1, 1, 1])
+        cfg_region = c_k1.text_input("AWS Region", value=st.session_state.get("aws_region", DEFAULT_REGION))
+        cfg_key = c_k2.text_input("AWS Access Key ID", value=st.session_state.get("aws_access_key", ""), type="password")
+        cfg_secret = c_k3.text_input("AWS Secret Key", value=st.session_state.get("aws_secret_key", ""), type="password")
+
+        c_p1, c_p2 = st.columns(2)
+        cfg_project = c_p1.text_input("Project Name Tag", value=DEFAULT_PROJECT)
+        cfg_asg = c_p2.text_input("Auto Scaling Group Name", value=DEFAULT_ASG)
+
+        if st.button("Save Credentials for Session"):
+            st.session_state["aws_region"] = cfg_region
+            st.session_state["aws_access_key"] = cfg_key
+            st.session_state["aws_secret_key"] = cfg_secret
+            st.success("Credentials saved to session state.")
+            st.rerun()
+
+    # Active session or environment credentials
+    active_key = st.session_state.get("aws_access_key") or None
+    active_secret = st.session_state.get("aws_secret_key") or None
+    active_region = st.session_state.get("aws_region") or DEFAULT_REGION
+    active_project = DEFAULT_PROJECT
+    active_asg = DEFAULT_ASG
+
+    # 1-Click Action Hub Container
+    with st.container(border=True):
+        st.subheader("⚡ 1-Click Cloud Controls")
+        st.markdown(
+            "Use the button below to **terminate all running EC2 cloud instances immediately** "
+            "and set the Auto Scaling Group capacity to `0`. This stops AWS compute charges instantly while preserving "
+            "your ALB and VPC configuration for immediate restart."
+        )
+
+        col_stop, col_start, col_refresh = st.columns([2, 1, 1])
+
+        with col_stop:
+            stop_clicked = st.button(
+                "🛑 Delete & Terminate All Running Cloud Instances",
+                type="primary",
+                use_container_width=True,
+                help="Sets ASG to 0 and terminates all active project EC2 instances."
+            )
+
+        with col_start:
+            start_clicked = st.button(
+                "🟢 Scale Up (1 Instance)",
+                use_container_width=True,
+                help="Restores 1 EC2 instance in the Auto Scaling Group."
+            )
+
+        with col_refresh:
+            if st.button("🔄 Refresh Status", use_container_width=True):
+                st.rerun()
+
+        # Handle Stop Action
+        if stop_clicked:
+            with st.spinner("Terminating all active cloud instances and scaling ASG to 0..."):
+                del_result = delete_all_running_instances(
+                    access_key=active_key,
+                    secret_key=active_secret,
+                    region=active_region,
+                    project_name=active_project,
+                    asg_name=active_asg,
+                )
+
+            if del_result.get("success"):
+                st.success(
+                    f"✅ **Action Complete!** {del_result.get('terminated_count', 0)} instance(s) terminated. "
+                    "Auto Scaling Group scaled to 0. AWS billing for compute instances is stopped."
+                )
+                with st.expander("View execution details", expanded=True):
+                    for act in del_result.get("actions", []):
+                        st.write(f"- {act}")
+                    if del_result.get("terminated_ids"):
+                        st.code(", ".join(del_result["terminated_ids"]), language="text")
+            else:
+                st.error(f"❌ Failed to terminate instances: {del_result.get('error')}")
+
+        # Handle Start Action
+        if start_clicked:
+            with st.spinner("Scaling up Auto Scaling Group..."):
+                up_result = scale_up_instances(
+                    count=1,
+                    access_key=active_key,
+                    secret_key=active_secret,
+                    region=active_region,
+                    asg_name=active_asg,
+                )
+            if up_result.get("success"):
+                st.success(up_result.get("message"))
+            else:
+                st.error(f"❌ Failed to scale up: {up_result.get('error')}")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # Fetch and display current cloud status
+    with st.spinner("Fetching live cloud status..."):
+        cloud_status = get_cloud_status(
+            access_key=active_key,
+            secret_key=active_secret,
+            region=active_region,
+            project_name=active_project,
+            asg_name=active_asg,
+        )
+
+    # Metrics row
+    m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+
+    if cloud_status.get("success"):
+        running_cnt = cloud_status.get("running_count", 0)
+        total_cnt = cloud_status.get("total_count", 0)
+        asg_data = cloud_status.get("asg") or {}
+        desired = asg_data.get("desired_capacity", "N/A")
+        min_max = f"{asg_data.get('min_size', 0)} / {asg_data.get('max_size', 0)}" if "min_size" in asg_data else "N/A"
+
+        m_col1.metric("Running Instances", running_cnt, delta="Active" if running_cnt > 0 else "Offline", delta_color="normal" if running_cnt > 0 else "off")
+        m_col2.metric("ASG Desired Capacity", desired)
+        m_col3.metric("ASG Min / Max", min_max)
+        m_col4.metric("AWS Region", cloud_status.get("region", active_region))
+
+        st.subheader("Cloud Instances")
+        instances_list = cloud_status.get("instances", [])
+        if instances_list:
+            display_rows = [
+                {
+                    "Instance ID": inst["id"],
+                    "Name": inst["name"],
+                    "State": inst["state"].upper(),
+                    "Type": inst["type"],
+                    "Public IP": inst["public_ip"],
+                    "Private IP": inst["private_ip"],
+                    "Launch Time": inst["launch_time"],
+                }
+                for inst in instances_list
+            ]
+            st.dataframe(display_rows, hide_index=True, use_container_width=True)
+        else:
+            st.info("ℹ️ No EC2 instances found with tag `Project: researchsphere` or in the Auto Scaling Group.")
+
+    else:
+        m_col1.metric("Running Instances", "Unknown")
+        m_col2.metric("ASG Desired Capacity", "Unknown")
+        m_col3.metric("ASG Min / Max", "Unknown")
+        m_col4.metric("AWS Region", active_region)
+
+        st.warning(f"Could not connect to AWS: {cloud_status.get('error')}")
+        st.info(
+            "💡 Ensure your AWS credentials are set via environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`), "
+            "AWS CLI configuration (`aws configure`), or provide them in the Configuration panel above."
+        )
+
+    st.divider()
+
+    # Alternative 1-Click Methods
+    st.subheader("📱 Alternative 1-Click Methods")
+    c_m1, c_m2 = st.columns(2)
+    with c_m1:
+        with st.container(border=True):
+            st.markdown("#### 🐙 GitHub Actions (Web)")
+            st.write(
+                "You can also delete all running cloud instances directly from GitHub without opening the app:\n"
+                "1. Go to your GitHub repository -> **Actions** tab\n"
+                "2. Select **🛑 Stop & Delete Cloud Instances (1-Click)**\n"
+                "3. Click **Run workflow**"
+            )
+            st.caption("Workflow file: `.github/workflows/cleanup-instances.yml`")
+
+    with c_m2:
+        with st.container(border=True):
+            st.markdown("#### 💻 Desktop 1-Click Script")
+            st.write(
+                "On your local Windows machine, you can delete running instances with a single double-click:\n"
+                "- Double-click `scripts/delete_instances.bat` in File Explorer\n"
+                "- Or run in PowerShell: `.\\scripts\\delete_instances.ps1`\n"
+                "- Or run in terminal: `python scripts/delete_instances.py`"
+            )
+            st.caption("Automatically scales down ASG to 0 and terminates all active instances.")
+
