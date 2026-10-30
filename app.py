@@ -29,6 +29,7 @@ from document_clustering import cluster_papers
 from cloud_manager import (
     get_cloud_status,
     delete_all_running_instances,
+    destroy_all_resources,
     scale_up_instances,
     DEFAULT_REGION,
     DEFAULT_PROJECT,
@@ -973,6 +974,43 @@ elif section == "Cloud Management":
     st.caption("Instantly scale down Auto Scaling Groups and terminate all running EC2 instances to stop AWS billing.")
     st.divider()
 
+    # Live Application URL (dynamically fetched from ALB)
+    with st.container(border=True):
+        st.subheader("🌐 Live Application URL")
+        st.markdown(
+            "The application URL changes every time the infrastructure is re-created (new deployment). "
+            "The URL below is fetched live from AWS each time this page loads."
+        )
+        try:
+            import boto3 as _boto3_url
+            _region_for_url = st.session_state.get("aws_region") or DEFAULT_REGION
+            _key_for_url = st.session_state.get("aws_access_key") or None
+            _secret_for_url = st.session_state.get("aws_secret_key") or None
+            _sess_kwargs: dict = {"region_name": _region_for_url}
+            if _key_for_url and _secret_for_url:
+                _sess_kwargs["aws_access_key_id"] = _key_for_url
+                _sess_kwargs["aws_secret_access_key"] = _secret_for_url
+            _elbv2 = _boto3_url.Session(**_sess_kwargs).client("elbv2")
+            _albs = _elbv2.describe_load_balancers(Names=["researchsphere-alb"]).get("LoadBalancers", [])
+            if _albs:
+                _dns = _albs[0]["DNSName"]
+                _live_url = f"http://{_dns}"
+                st.success(f"✅ **Application is deployed!**")
+                st.markdown(f"### 👉 [{_live_url}]({_live_url})")
+                st.caption(f"DNS: `{_dns}`")
+                st.markdown(
+                    "> 💡 Always use **`http://`** (not `https://`). "
+                    "If you see a DNS error in the browser, wait 2-3 minutes after deployment — the instance is still booting."
+                )
+            else:
+                st.warning("⚠️ No active Load Balancer found. Deploy the application first via GitHub Actions.")
+        except Exception as _e:
+            st.info(
+                "ℹ️ Could not auto-fetch the URL from AWS. Set credentials in the **⚙️ AWS Configuration** panel below, "
+                "or check the **GitHub Actions deploy job summary** for the latest URL.\n\n"
+                f"Reason: `{_e}`"
+            )
+
     # Credential & Configuration Expander
     with st.expander("⚙️ AWS Configuration & Credentials (Optional)", expanded=False):
         c_k1, c_k2, c_k3 = st.columns([1, 1, 1])
@@ -1001,34 +1039,89 @@ elif section == "Cloud Management":
     # 1-Click Action Hub Container
     with st.container(border=True):
         st.subheader("⚡ 1-Click Cloud Controls")
-        st.markdown(
-            "Use the button below to **terminate all running EC2 cloud instances immediately** "
-            "and set the Auto Scaling Group capacity to `0`. This stops AWS compute charges instantly while preserving "
-            "your ALB and VPC configuration for immediate restart."
-        )
 
         col_stop, col_start, col_refresh = st.columns([2, 1, 1])
 
         with col_stop:
             stop_clicked = st.button(
-                "🛑 Delete & Terminate All Running Cloud Instances",
+                "🛑 Stop Instances (Scale to 0)",
                 type="primary",
                 use_container_width=True,
-                help="Sets ASG to 0 and terminates all active project EC2 instances."
+                help="Sets ASG to 0 and terminates all active project EC2 instances. ALB & VPC stay alive for quick restart.",
+                key="btn_stop"
             )
 
         with col_start:
             start_clicked = st.button(
                 "🟢 Scale Up (1 Instance)",
                 use_container_width=True,
-                help="Restores 1 EC2 instance in the Auto Scaling Group."
+                help="Restores 1 EC2 instance in the Auto Scaling Group.",
+                key="btn_start"
             )
 
         with col_refresh:
-            if st.button("🔄 Refresh Status", use_container_width=True):
+            if st.button("🔄 Refresh", use_container_width=True, key="btn_refresh"):
                 st.rerun()
 
-        # Handle Stop Action
+    # Terminate All Resources section (separate danger zone)
+    with st.container(border=True):
+        st.subheader("💥 Terminate ALL Resources (Danger Zone)")
+        st.markdown(
+            "This will **permanently delete** all AWS resources: Auto Scaling Group, Load Balancer, Target Group, and EC2 instances. "
+            "VPC/Security Groups/Route Tables can only be fully removed via the **GitHub Actions** `full_destroy` workflow."
+        )
+
+        confirm_col, destroy_col = st.columns([3, 1])
+        with confirm_col:
+            confirm_text = st.text_input(
+                "Type **TERMINATE** to confirm full resource destruction",
+                placeholder="TERMINATE",
+                key="terminate_confirm",
+                label_visibility="visible"
+            )
+        with destroy_col:
+            st.markdown("<br>", unsafe_allow_html=True)
+            destroy_clicked = st.button(
+                "💥 Terminate ALL",
+                type="primary",
+                use_container_width=True,
+                help="Permanently destroys ALB, ASG, EC2 instances.",
+                key="btn_destroy"
+            )
+
+        if destroy_clicked:
+            if confirm_text.strip() != "TERMINATE":
+                st.error("❌ Type **TERMINATE** in the box above to confirm. This action cannot be undone.")
+            else:
+                with st.spinner("☠️ Terminating all AWS resources (ASG, ALB, EC2 instances)..."):
+                    destroy_result = destroy_all_resources(
+                        access_key=active_key,
+                        secret_key=active_secret,
+                        region=active_region,
+                        project_name=active_project,
+                        asg_name=active_asg,
+                    )
+
+                if destroy_result.get("success"):
+                    st.success("✅ All resources terminated successfully!")
+                else:
+                    st.warning("⚠️ Partial completion — some resources may need manual cleanup.")
+
+                with st.expander("Execution Details", expanded=True):
+                    for act in destroy_result.get("actions", []):
+                        st.write(act)
+                    for err in destroy_result.get("errors", []):
+                        st.error(f"Error: {err}")
+                    if destroy_result.get("note"):
+                        st.info(f"💡 {destroy_result['note']}")
+                    if destroy_result.get("error"):
+                        st.error(destroy_result["error"])
+
+                st.info(
+                    "For **complete cleanup** including VPC, Subnets and Security Groups, "
+                    "go to GitHub Actions → **🛑 Terminate AWS Resources (1-Click)** → Run workflow → select **full_destroy**."
+                )
+
         if stop_clicked:
             with st.spinner("Terminating all active cloud instances and scaling ASG to 0..."):
                 del_result = delete_all_running_instances(

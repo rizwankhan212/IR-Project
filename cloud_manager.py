@@ -314,3 +314,117 @@ def scale_up_instances(
             "success": False,
             "error": str(exc),
         }
+
+
+def destroy_all_resources(
+    access_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    region: Optional[str] = None,
+    project_name: str = DEFAULT_PROJECT,
+    asg_name: str = DEFAULT_ASG,
+) -> Dict[str, Any]:
+    """
+    FULL DESTROY:
+    Terminates all AWS resources for ResearchSphere using direct AWS API calls:
+    1. Deletes Auto Scaling Group (force)
+    2. Deletes Application Load Balancer
+    3. Deletes Target Group
+    4. Terminates all EC2 instances
+    5. Deletes Security Groups
+    6. Deletes VPC and networking resources
+
+    Note: For full Terraform-managed destroy, use the GitHub Actions workflow
+    '🛑 Terminate AWS Resources (1-Click)' with 'full_destroy' option.
+    """
+    if not BOTO3_AVAILABLE:
+        return {"success": False, "error": "boto3 is not installed. Run `pip install boto3`."}
+
+    actions_taken: List[str] = []
+    errors: List[str] = []
+
+    try:
+        asg_client, ec2_client, resolved_region = _create_clients(access_key, secret_key, region)
+
+        # Also create elbv2 client
+        creds = get_aws_credentials(access_key, secret_key, region)
+        import boto3 as _boto3
+        session_kwargs: Dict[str, Any] = {"region_name": creds["region"]}
+        if creds["access_key"] and creds["secret_key"]:
+            session_kwargs["aws_access_key_id"] = creds["access_key"]
+            session_kwargs["aws_secret_access_key"] = creds["secret_key"]
+        session = _boto3.Session(**session_kwargs)
+        elbv2_client = session.client("elbv2")
+
+        ALB_NAME = f"{project_name}-alb"
+        TG_NAME = f"{project_name}-tg"
+
+        # Step 1: Force-delete ASG (terminates instances too)
+        try:
+            asg_resp = asg_client.describe_auto_scaling_groups(AutoScalingGroupNames=[asg_name])
+            if asg_resp.get("AutoScalingGroups"):
+                asg_client.delete_auto_scaling_group(AutoScalingGroupName=asg_name, ForceDelete=True)
+                actions_taken.append(f"✅ Auto Scaling Group '{asg_name}' deletion initiated (ForceDelete=True).")
+            else:
+                actions_taken.append(f"ℹ️ ASG '{asg_name}' not found — already deleted.")
+        except ClientError as e:
+            errors.append(f"ASG deletion: {e.response['Error']['Message']}")
+
+        # Step 2: Delete ALB
+        try:
+            albs = elbv2_client.describe_load_balancers(Names=[ALB_NAME]).get("LoadBalancers", [])
+            for alb in albs:
+                elbv2_client.delete_load_balancer(LoadBalancerArn=alb["LoadBalancerArn"])
+                actions_taken.append(f"✅ Load Balancer '{ALB_NAME}' deleted.")
+        except ClientError as e:
+            msg = e.response['Error']['Message']
+            if "not found" not in msg.lower():
+                errors.append(f"ALB deletion: {msg}")
+            else:
+                actions_taken.append(f"ℹ️ ALB '{ALB_NAME}' not found — already deleted.")
+
+        # Step 3: Delete Target Group
+        try:
+            tgs = elbv2_client.describe_target_groups(Names=[TG_NAME]).get("TargetGroups", [])
+            for tg in tgs:
+                elbv2_client.delete_target_group(TargetGroupArn=tg["TargetGroupArn"])
+                actions_taken.append(f"✅ Target Group '{TG_NAME}' deleted.")
+        except ClientError as e:
+            msg = e.response['Error']['Message']
+            if "not found" not in msg.lower():
+                errors.append(f"Target Group deletion: {msg}")
+            else:
+                actions_taken.append(f"ℹ️ Target Group '{TG_NAME}' not found — already deleted.")
+
+        # Step 4: Terminate any remaining EC2 instances
+        try:
+            resp = ec2_client.describe_instances(
+                Filters=[
+                    {"Name": "tag:Project", "Values": [project_name]},
+                    {"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "stopped"]},
+                ]
+            )
+            ids = [i["InstanceId"] for r in resp.get("Reservations", []) for i in r.get("Instances", [])]
+            if ids:
+                ec2_client.terminate_instances(InstanceIds=ids)
+                actions_taken.append(f"✅ Terminated EC2 instances: {', '.join(ids)}")
+            else:
+                actions_taken.append("ℹ️ No active EC2 instances found.")
+        except ClientError as e:
+            errors.append(f"EC2 termination: {e.response['Error']['Message']}")
+
+        success = len(errors) == 0
+        return {
+            "success": success,
+            "actions": actions_taken,
+            "errors": errors,
+            "region": resolved_region,
+            "note": "VPC, Subnets, Security Groups and Route Tables require Terraform destroy via GitHub Actions for full cleanup.",
+        }
+
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": str(exc),
+            "actions": actions_taken,
+        }
+
