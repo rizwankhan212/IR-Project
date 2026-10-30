@@ -195,6 +195,24 @@ jobs:
         working-directory: ./terraform
         run: terraform validate
 
+      - name: ⏳ Wait for ASG Deletion to Complete
+        run: |
+          echo "Checking for any pending ASG deletion..."
+          for i in {1..30}; do
+            STATUS=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names researchsphere-asg --query "AutoScalingGroups[0].Status" --output text 2>/dev/null || echo "None")
+            if [ "$STATUS" = "None" ] || [ -z "$STATUS" ] || [ "$STATUS" = "null" ]; then
+              echo "ASG name is clear and ready."
+              break
+            fi
+            if echo "$STATUS" | grep -qi "Delete"; then
+              echo "ASG deletion in progress ($STATUS). Waiting 10s ($i/30)..."
+              sleep 10
+            else
+              echo "Existing ASG status is $STATUS."
+              break
+            fi
+          done
+
       - name: 📊 Terraform Plan
         working-directory: ./terraform
         run: terraform plan -out=tfplan -input=false
