@@ -1,27 +1,33 @@
 # ============================================================
-# 1-Click Cloud Instance Terminator & Cleanup Workflow
+# Terminate & Destroy AWS Resources Workflow (1-Click)
 # ============================================================
-# Allows deleting all running cloud instances in 1-click from GitHub Actions.
+# Allows terminating/destroying all AWS cloud resources in 1 click
+# from the GitHub Actions "Run workflow" button.
 #
 # Options:
-#   1. scale_to_zero (Default): Scales ASG to 0 and terminates all EC2 instances immediately.
-#      Stops EC2 billing completely while preserving VPC/ALB for instant restart.
-#   2. full_destroy: Runs 'terraform destroy' to delete all AWS resources entirely.
+#   1. full_destroy (Default): Runs 'terraform destroy' using the S3
+#      remote backend to cleanly delete ALL AWS resources (ALB, ASG,
+#      EC2, VPC, Subnets, Security Groups, CloudWatch Alarms).
+#   2. scale_to_zero: Quickly scales Auto Scaling Group to 0 and terminates
+#      all running EC2 instances to immediately stop compute billing.
+#   3. destroy_all_and_s3: Destroys all infrastructure AND deletes
+#      the S3 Terraform state bucket for 100% complete cleanup.
 # ============================================================
 
-name: 🛑 Stop & Delete Cloud Instances (1-Click)
+name: 🛑 Terminate AWS Resources (1-Click)
 
 on:
   workflow_dispatch:
     inputs:
       action_mode:
-        description: "Select Cleanup Action"
+        description: "Select Termination Action"
         required: true
-        default: "scale_to_zero"
+        default: "full_destroy"
         type: choice
         options:
-          - "scale_to_zero"
           - "full_destroy"
+          - "scale_to_zero"
+          - "destroy_all_and_s3"
 
 concurrency:
   group: cloud-cleanup
@@ -29,27 +35,37 @@ concurrency:
 
 jobs:
   # ────────────────────────────────────────────────────────────
-  # Action 1: Scale ASG to 0 & Terminate EC2 Instances (Fast 1-Click)
+  # Action 1: Scale ASG to 0 & Terminate EC2 Instances Immediately
   # ────────────────────────────────────────────────────────────
   scale-to-zero:
-    name: 🛑 Scale to 0 & Terminate All Instances
+    name: 🛑 Scale to 0 (Stop Compute Billing)
     runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.action_mode == 'scale_to_zero' || github.event.inputs.action_mode == '' }}
+    if: ${{ github.event.inputs.action_mode == 'scale_to_zero' }}
 
     steps:
-      - name: 🔑 Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🔑 Sanitize & Export AWS Credentials
+        run: |
+          CLEAN_KEY=$(echo -n "${{ secrets.AWS_ACCESS_KEY_ID }}" | tr -d '[:space:]' | tr -d '"' | tr -d "'")
+          CLEAN_SECRET=$(echo -n "${{ secrets.AWS_SECRET_ACCESS_KEY }}" | tr -d '[:space:]' | tr -d '"' | tr -d "'")
+          CLEAN_REGION=$(echo -n "${{ secrets.AWS_REGION || 'us-east-1' }}" | tr -d '[:space:]' | tr -d '"' | tr -d "'")
+
+          echo "::add-mask::$CLEAN_KEY"
+          echo "::add-mask::$CLEAN_SECRET"
+
+          echo "AWS_ACCESS_KEY_ID=$CLEAN_KEY" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=$CLEAN_SECRET" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=$CLEAN_REGION" >> $GITHUB_ENV
+          echo "AWS_REGION=$CLEAN_REGION" >> $GITHUB_ENV
 
       - name: ⚙️ Scale Down Auto Scaling Group to 0
         id: scale_asg
         run: |
           ASG_NAME="researchsphere-asg"
           echo "Scaling down ASG: $ASG_NAME to min=0, desired=0..."
-          if aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG_NAME" | grep -q "$ASG_NAME"; then
+          if aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG_NAME" --query "AutoScalingGroups[0].AutoScalingGroupName" --output text 2>/dev/null | grep -q "$ASG_NAME"; then
             aws autoscaling update-auto-scaling-group \
               --auto-scaling-group-name "$ASG_NAME" \
               --min-size 0 \
@@ -68,7 +84,7 @@ jobs:
           INSTANCE_IDS=$(aws ec2 describe-instances \
             --filters "Name=tag:Project,Values=researchsphere" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
             --query "Reservations[].Instances[].InstanceId" \
-            --output text)
+            --output text 2>/dev/null || echo "")
 
           if [ -n "$INSTANCE_IDS" ] && [ "$INSTANCE_IDS" != "None" ]; then
             echo "Found active instances: $INSTANCE_IDS"
@@ -83,7 +99,7 @@ jobs:
 
       - name: 📋 Summary
         run: |
-          echo "### 🛑 Cloud Instances Successfully Terminated" >> $GITHUB_STEP_SUMMARY
+          echo "### 🛑 Cloud Compute Instances Terminated" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Action | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|--------|--------|" >> $GITHUB_STEP_SUMMARY
@@ -92,7 +108,7 @@ jobs:
           echo "| **Instances Terminated Count** | ${{ steps.terminate_ec2.outputs.count }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **Compute Billing Status** | 🛑 **STOPPED** |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "All running cloud compute instances have been terminated in one click." >> $GITHUB_STEP_SUMMARY
+          echo "All EC2 instances terminated. VPC and ALB are preserved for fast re-deployment." >> $GITHUB_STEP_SUMMARY
 
   # ────────────────────────────────────────────────────────────
   # Action 2: Complete Terraform Destroy (Full Infrastructure Cleanup)
@@ -100,36 +116,71 @@ jobs:
   terraform-destroy:
     name: 💥 Full Infrastructure Destroy
     runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.action_mode == 'full_destroy' }}
-
-    env:
-      TF_VAR_aws_access_key: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      TF_VAR_aws_secret_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      TF_VAR_aws_region: ${{ secrets.AWS_REGION || 'us-east-1' }}
-      TF_VAR_docker_image: "ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:latest"
-      TF_VAR_ghcr_username: ${{ github.actor }}
-      TF_VAR_ghcr_token: ${{ secrets.GITHUB_TOKEN }}
-      TF_VAR_key_pair_name: ${{ secrets.EC2_KEY_PAIR_NAME }}
+    if: ${{ github.event.inputs.action_mode == 'full_destroy' || github.event.inputs.action_mode == 'destroy_all_and_s3' || github.event.inputs.action_mode == '' }}
 
     steps:
       - name: 📥 Checkout repository
         uses: actions/checkout@v4
+
+      - name: 🔑 Sanitize & Export AWS Credentials
+        run: |
+          CLEAN_KEY=$(echo -n "${{ secrets.AWS_ACCESS_KEY_ID }}" | tr -d '[:space:]' | tr -d '"' | tr -d "'")
+          CLEAN_SECRET=$(echo -n "${{ secrets.AWS_SECRET_ACCESS_KEY }}" | tr -d '[:space:]' | tr -d '"' | tr -d "'")
+          CLEAN_REGION=$(echo -n "${{ secrets.AWS_REGION || 'us-east-1' }}" | tr -d '[:space:]' | tr -d '"' | tr -d "'")
+
+          echo "::add-mask::$CLEAN_KEY"
+          echo "::add-mask::$CLEAN_SECRET"
+
+          echo "AWS_ACCESS_KEY_ID=$CLEAN_KEY" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=$CLEAN_SECRET" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=$CLEAN_REGION" >> $GITHUB_ENV
+          echo "AWS_REGION=$CLEAN_REGION" >> $GITHUB_ENV
+          echo "TF_VAR_aws_access_key=$CLEAN_KEY" >> $GITHUB_ENV
+          echo "TF_VAR_aws_secret_key=$CLEAN_SECRET" >> $GITHUB_ENV
+          echo "TF_VAR_aws_region=$CLEAN_REGION" >> $GITHUB_ENV
+
+          # Lowercase image variable for terraform validation
+          IMAGE_LOWER=$(echo "ghcr.io/${{ github.repository }}:latest" | tr '[:upper:]' '[:lower:]')
+          echo "TF_VAR_docker_image=$IMAGE_LOWER" >> $GITHUB_ENV
+
+          BUCKET="researchsphere-state-${{ github.repository_owner }}"
+          echo "TF_STATE_BUCKET=$(echo "$BUCKET" | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
 
       - name: ⚙️ Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.9.x"
 
-      - name: 🔍 Terraform Init
+      - name: 🔍 Terraform Init (Connect to S3 Remote State)
         working-directory: ./terraform
-        run: terraform init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
+            -backend-config="key=researchsphere/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_DEFAULT_REGION }}"
 
       - name: 💥 Terraform Destroy
         working-directory: ./terraform
         run: terraform destroy -auto-approve -input=false
 
+      - name: 🪣 (Optional) Delete S3 State Bucket
+        if: ${{ github.event.inputs.action_mode == 'destroy_all_and_s3' }}
+        run: |
+          echo "Emptying and deleting S3 state bucket: ${{ env.TF_STATE_BUCKET }}..."
+          aws s3 rb "s3://${{ env.TF_STATE_BUCKET }}" --force || echo "Bucket already deleted or empty"
+
       - name: 📋 Summary
         run: |
-          echo "### 💥 Full Cloud Infrastructure Destroyed" >> $GITHUB_STEP_SUMMARY
+          echo "### 💥 Full AWS Infrastructure Destroyed" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "All EC2 instances, Application Load Balancers, Security Groups, and VPC resources have been destroyed." >> $GITHUB_STEP_SUMMARY
+          echo "| Resource Type | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **EC2 Instances** | 🗑️ Terminated |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Auto Scaling Group** | 🗑️ Deleted |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Application Load Balancer** | 🗑️ Deleted |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Target Groups** | 🗑️ Deleted |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Security Groups** | 🗑️ Deleted |" >> $GITHUB_STEP_SUMMARY
+          echo "| **VPC & Subnets** | 🗑️ Deleted |" >> $GITHUB_STEP_SUMMARY
+          echo "| **CloudWatch Alarms** | 🗑️ Deleted |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "All AWS resources created for ResearchSphere have been completely terminated and destroyed." >> $GITHUB_STEP_SUMMARY

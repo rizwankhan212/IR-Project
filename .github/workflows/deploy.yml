@@ -225,32 +225,76 @@ jobs:
         working-directory: ./terraform
         id: tf_output
         run: |
-          echo "alb_url=$(terraform output -raw alb_url)" >> $GITHUB_OUTPUT
-          echo "asg_name=$(terraform output -raw asg_name)" >> $GITHUB_OUTPUT
+          ALB_URL=$(terraform output -raw application_url)
+          HEALTH_URL=$(terraform output -raw health_check_url)
+          ASG_NAME=$(terraform output -raw asg_name)
+          echo "alb_url=$ALB_URL" >> $GITHUB_OUTPUT
+          echo "health_url=$HEALTH_URL" >> $GITHUB_OUTPUT
+          echo "asg_name=$ASG_NAME" >> $GITHUB_OUTPUT
 
       - name: 🔄 Trigger ASG Instance Refresh
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
         run: |
           aws autoscaling start-instance-refresh \
             --auto-scaling-group-name "${{ steps.tf_output.outputs.asg_name }}" \
             --preferences '{"MinHealthyPercentage": 50, "InstanceWarmup": 120}' \
             || echo "Instance refresh may already be in progress"
 
-      - name: 📋 Deployment Summary
+      - name: 🩺 Wait for Application to Deploy on Instance
+        id: health_check
         run: |
+          HEALTH_URL="${{ steps.tf_output.outputs.health_url }}"
+          APP_URL="${{ steps.tf_output.outputs.alb_url }}"
+          echo "Waiting for Streamlit container to boot on the EC2 instance and pass ALB health checks..."
+          echo "Polling: $HEALTH_URL"
+          
+          MAX_RETRIES=35
+          IS_HEALTHY="false"
+          for ((i=1; i<=MAX_RETRIES; i++)); do
+            HTTP_STATUS=$(curl -s -m 5 -o /dev/null -w "%{http_code}" "$HEALTH_URL" || echo "000")
+            if [ "$HTTP_STATUS" = "200" ]; then
+              echo "🎉 [Attempt $i/$MAX_RETRIES] Application is LIVE and healthy (HTTP 200)!"
+              IS_HEALTHY="true"
+              break
+            else
+              echo "⏳ [Attempt $i/$MAX_RETRIES] Response: HTTP $HTTP_STATUS — Waiting 10s for container initialization..."
+              sleep 10
+            fi
+          done
+          echo "healthy=$IS_HEALTHY" >> $GITHUB_OUTPUT
+
+      - name: 📋 Display Live Application URL
+        run: |
+          APP_URL="${{ steps.tf_output.outputs.alb_url }}"
+          IS_HEALTHY="${{ steps.health_check.outputs.healthy }}"
+
+          echo "=========================================================="
+          echo "             🚀 RESEARCHSPHERE DEPLOYMENT                 "
+          echo "=========================================================="
+          echo "  Application URL : $APP_URL"
+          echo "  Status          : $( [ "$IS_HEALTHY" = "true" ] && echo "LIVE (HTTP 200)" || echo "WARMING UP" )"
+          echo "=========================================================="
+
           echo "### 🚀 Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "$IS_HEALTHY" = "true" ]; then
+            echo "## ✅ Application is LIVE and Ready to Use!" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "👉 **Access URL:** [$APP_URL]($APP_URL)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ⏳ Application is Warming Up" >> $GITHUB_STEP_SUMMARY
+            echo "> The instance is pulling the image and starting Streamlit. It will be available shortly at:" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "👉 **URL:** [$APP_URL]($APP_URL)" >> $GITHUB_STEP_SUMMARY
+          fi
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| **Application URL** | ${{ steps.tf_output.outputs.alb_url }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **ASG Name** | ${{ steps.tf_output.outputs.asg_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Application URL** | \`$APP_URL\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Health Status** | \`$([ "$IS_HEALTHY" = "true" ] && echo "Healthy (HTTP 200)" || echo "Warming Up")\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Auto Scaling Group** | \`${{ steps.tf_output.outputs.asg_name }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Docker Image** | \`${{ env.TF_VAR_docker_image }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "> 💡 **Important:** Always open with **http://** (not https). If the URL shows \`***\`, replace \`***\` with your AWS region (\`${{ secrets.AWS_REGION || 'us-east-1' }}\`)." >> $GITHUB_STEP_SUMMARY
-          echo "> ⏳ The application may take 2-3 minutes to become available after deployment." >> $GITHUB_STEP_SUMMARY
+          echo "> 💡 **Note:** Open using **http://** (not https). If the domain displays \`***\`, replace \`***\` with your AWS region (\`${{ env.AWS_DEFAULT_REGION || 'us-east-1' }}\`)." >> $GITHUB_STEP_SUMMARY
 
   # ────────────────────────────────────────────────────────────
   # Job 3: Terraform Plan on PRs (review before merge)
