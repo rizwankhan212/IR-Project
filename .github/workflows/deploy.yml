@@ -135,9 +135,55 @@ jobs:
         with:
           terraform_version: "1.9.x"
 
+      - name: 🪣 Setup S3 Backend for Terraform State
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+        run: |
+          BUCKET="researchsphere-state-${{ github.repository_owner }}"
+          BUCKET_LOWER=$(echo "$BUCKET" | tr '[:upper:]' '[:lower:]')
+          echo "TF_STATE_BUCKET=$BUCKET_LOWER" >> $GITHUB_ENV
+
+          echo "Checking S3 state bucket $BUCKET_LOWER..."
+          if aws s3api head-bucket --bucket "$BUCKET_LOWER" 2>/dev/null; then
+            echo "Bucket already exists."
+          else
+            REGION="${{ secrets.AWS_REGION || 'us-east-1' }}"
+            echo "Creating bucket $BUCKET_LOWER in $REGION..."
+            if [ "$REGION" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "$BUCKET_LOWER" --region us-east-1
+            else
+              aws s3api create-bucket --bucket "$BUCKET_LOWER" --region "$REGION" --create-bucket-configuration LocationConstraint="$REGION"
+            fi
+            aws s3api put-bucket-versioning --bucket "$BUCKET_LOWER" --versioning-configuration Status=Enabled
+          fi
+
+          # Initial S3 Migration: if state does not exist in S3 yet, clean up conflicting orphaned ALB/TG from earlier runs
+          if ! aws s3api head-object --bucket "$BUCKET_LOWER" --key "researchsphere/terraform.tfstate" 2>/dev/null; then
+            echo "State not found in S3. Cleaning up any conflicting orphaned resources from previous runs..."
+            aws autoscaling delete-auto-scaling-group --auto-scaling-group-name researchsphere-asg --force-delete 2>/dev/null || true
+            ALB_ARN=$(aws elbv2 describe-load-balancers --names researchsphere-alb --query "LoadBalancers[0].LoadBalancerArn" --output text 2>/dev/null || true)
+            if [ -n "$ALB_ARN" ] && [ "$ALB_ARN" != "None" ]; then
+              echo "Deleting orphan ALB: $ALB_ARN"
+              aws elbv2 delete-load-balancer --load-balancer-arn "$ALB_ARN"
+              echo "Waiting 15s for ALB deletion..."
+              sleep 15
+            fi
+            TG_ARN=$(aws elbv2 describe-target-groups --names researchsphere-tg --query "TargetGroups[0].TargetGroupArn" --output text 2>/dev/null || true)
+            if [ -n "$TG_ARN" ] && [ "$TG_ARN" != "None" ]; then
+              echo "Deleting orphan Target Group: $TG_ARN"
+              aws elbv2 delete-target-group --target-group-arn "$TG_ARN" 2>/dev/null || true
+            fi
+          fi
+
       - name: 🔍 Terraform Init
         working-directory: ./terraform
-        run: terraform init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
+            -backend-config="key=researchsphere/terraform.tfstate" \
+            -backend-config="region=${{ secrets.AWS_REGION || 'us-east-1' }}"
 
       - name: 📝 Terraform Validate
         working-directory: ./terraform
@@ -221,9 +267,37 @@ jobs:
         with:
           terraform_version: "1.9.x"
 
+      - name: 🪣 Setup S3 Backend for Terraform State
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+        run: |
+          BUCKET="researchsphere-state-${{ github.repository_owner }}"
+          BUCKET_LOWER=$(echo "$BUCKET" | tr '[:upper:]' '[:lower:]')
+          echo "TF_STATE_BUCKET=$BUCKET_LOWER" >> $GITHUB_ENV
+
+          echo "Checking S3 state bucket $BUCKET_LOWER..."
+          if aws s3api head-bucket --bucket "$BUCKET_LOWER" 2>/dev/null; then
+            echo "Bucket already exists."
+          else
+            REGION="${{ secrets.AWS_REGION || 'us-east-1' }}"
+            echo "Creating bucket $BUCKET_LOWER in $REGION..."
+            if [ "$REGION" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "$BUCKET_LOWER" --region us-east-1
+            else
+              aws s3api create-bucket --bucket "$BUCKET_LOWER" --region "$REGION" --create-bucket-configuration LocationConstraint="$REGION"
+            fi
+            aws s3api put-bucket-versioning --bucket "$BUCKET_LOWER" --versioning-configuration Status=Enabled
+          fi
+
       - name: 🔍 Terraform Init
         working-directory: ./terraform
-        run: terraform init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
+            -backend-config="key=researchsphere/terraform.tfstate" \
+            -backend-config="region=${{ secrets.AWS_REGION || 'us-east-1' }}"
 
       - name: 📊 Terraform Plan
         working-directory: ./terraform
