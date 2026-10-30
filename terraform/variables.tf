@@ -12,13 +12,16 @@ variable "aws_access_key" {
   description = "AWS Access Key ID (from GitHub Secrets)"
   type        = string
   sensitive   = true
+  default     = ""
 }
 
 variable "aws_secret_key" {
   description = "AWS Secret Access Key (from GitHub Secrets)"
   type        = string
   sensitive   = true
+  default     = ""
 }
+
 
 variable "project_name" {
   description = "Name prefix for all resources"
