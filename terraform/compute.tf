@@ -6,9 +6,21 @@
 locals {
   ami_id = var.ami_id != "" ? var.ami_id : data.aws_ami.amazon_linux.id
 
+  # Docker repository names MUST be lowercase
+  docker_image_normalized = lower(trimspace(var.docker_image))
+
   user_data = <<-USERDATA
     #!/bin/bash
     set -euxo pipefail
+
+    # ── Create 2GB swap space to prevent OOM on t3.micro ───
+    if ! swapon --show | grep -q "/swapfile"; then
+      dd if=/dev/zero of=/swapfile bs=128M count=16
+      chmod 600 /swapfile
+      mkswap /swapfile
+      swapon /swapfile
+      echo "/swapfile swap swap defaults 0 0" >> /etc/fstab
+    fi
 
     # ── System updates ──────────────────────────────────────
     dnf update -y
@@ -18,19 +30,17 @@ locals {
 
     # ── GHCR login (if credentials provided) ────────────────
     %{if var.ghcr_username != "" && var.ghcr_token != ""}
-    echo "${var.ghcr_token}" | docker login ghcr.io -u "${var.ghcr_username}" --password-stdin
+    echo "${var.ghcr_token}" | docker login ghcr.io -u "${var.ghcr_username}" --password-stdin || true
     %{endif}
 
     # ── Pull and run the application container ──────────────
-    docker pull ${var.docker_image}
+    docker pull ${local.docker_image_normalized}
 
     docker run -d \
       --name researchsphere \
       --restart always \
       -p 8501:8501 \
-      --memory="900m" \
-      --cpus="0.8" \
-      ${var.docker_image}
+      ${local.docker_image_normalized}
 
     echo "ResearchSphere container started successfully"
   USERDATA
